@@ -1,0 +1,256 @@
+---
+title: "Bureau d'étude - Code1"
+autor: 'Flora AUTER et Raissa YAMEOGO'
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+
+Il y a une base de données contenant les précipitation en kg/m2/s et la vitesse du vent (pas utilisée pour le moment). Ce sont des données journalières et sur la prériode de 1951 à 2005. 
+Nous avons ces données pour différentes coordonnées (latitude, longitude) espacées de manière régulière.
+Dans un premier temps on s'interresse aux precipitations à un point géographique, la commune de Ponteil et Brésis dans le Gard. 
+latitude : 43.9974
+longitude : 3.38334
+
+
+# Parckages utiles 
+```{r}
+library(ggplot2)
+library(data.table)
+library(leaflet)
+
+library(magrittr)
+```
+
+# Lecture des données 
+
+```{r}
+#Lecture de la tble du Gard 
+gard<-read.table("Aveyron.txt")
+colnames(gard) = c('date', 'latitude', 'longitude', 'precipitation', 'vent')
+gard$date = as.Date(as.character(gard$date), format = "%Y%m%d")
+gard$precipitation = gard$precipitation * 86400
+```
+
+
+
+données de projection 
+```{r}
+#Lecture de la tble du Gard 
+proj<-read.table("Aveyron-2006.txt")
+colnames(proj) = c('date', 'latitude', 'longitude', 'temperature', 'precipitation', 'vent')
+proj$date = as.Date(as.character(proj$date), format = "%Y%m%d")
+proj=proj[, -4]
+```
+
+Concaténation 
+```{r}
+gard = rbind(gard, proj)
+```
+
+
+```{r}
+gard$year = format(gard$date, format = "%Y")
+gard$month = format(gard$date, format = "%m")
+gard$day = format(gard$date, format = "%d")
+```
+
+# Debut de l'étude des précipitation pour la commune selectionnées
+```{r}
+SFmap <- leaflet() %>%
+  addTiles() %>% 
+  setView(3.08447, 43.9999, zoom = 20) %>% 
+  addCircleMarkers(lng = 3.08447, lat = 43.9999, weight = 10, color = "red", opacity = 0.74,              radius = 10)
+     
+SFmap
+```
+
+```{r}
+g_comm = gard[ which(gard$longitude==3.08447 & gard$latitude==43.9999),  ]
+g_comm =  g_comm[ , c(1,4,6,7,8)]
+
+```
+
+# Visualisation des données 
+```{r}
+ggplot(g_comm, aes(x=date, y=precipitation)) +
+  geom_point(size=2, shape=23)+
+  ggtitle("Précipitations au cours du temps") +
+  xlab("Date") + ylab("Précipitations (mm)")
+
+```
+Répartition des précipitations
+```{r}
+ggplot(g_comm, aes(x=precipitation)) + geom_histogram(binwidth=10, bins=1000) + ggtitle("Répartition des précipitations")+xlab("Précipitations (mm)")
+
+```
+Réparitions des précipitations supérieur à 20 mm par jour ( permet d'éviter l'écrasement des données)
+```{r}
+ggplot(g_comm[ - which(g_comm$precipitation<20 ), ], aes(x=precipitation)) + geom_histogram(binwidth=10)+ ggtitle("Répartition des précipitations")+xlab("Précipitations (mm)")
+
+
+```
+
+```{r}
+
+seuil = seq(80,500,10)
+nb_evenements=c()
+for(i in 1:length(seuil)){
+  nb_evenements = c(nb_evenements, dim(g_comm[which(g_comm$precipitation > seuil[i]), ])[1])
+  if(nb_evenements[length(nb_evenements)]==0){
+    break
+  }
+}
+
+rep = as.data.frame(cbind(seuil[1: length(nb_evenements)], nb_evenements))
+colnames(rep) = c('Seuil de précipitations (mm)', 'Nombre d\'evènements supérieurs au seuil')
+rep
+```
+Sur cette commune il semblerait qu'il y ait eu un seul evennement cevenol. 
+
+Combien de jours durent ces evennements ? 
+
+```{r}
+g_comm[(which(g_comm$precipitation == max(g_comm$precipitation)) -3): (which(g_comm$precipitation == max(g_comm$precipitation))+3) ,]
+
+# Un seul jour
+```
+
+
+Moyenne des précipitation par an
+```{r}
+data = setDT(g_comm)
+```
+
+```{r}
+moy = data[,.(PrecMoy = mean(precipitation)), by= data$year]
+moy$data = as.integer(moy$data)
+plot(moy$data,moy$PrecMoy)
+```
+Maximum des précipitation par an
+```{r}
+max = data[,.(PrecMax = max(precipitation)), by= data$year]
+max$data = as.integer(max$data)
+plot(max$data,max$PrecMax)
+```
+```{r}
+ggplot(max, aes(x=data, y=PrecMax)) +
+  geom_point(size=2, shape=23)+
+  ggtitle("Maximum des précipitations par an au cours du temps") +
+  xlab("Date") + ylab("Précipitations (mm)")
+
+```
+
+
+
+
+Analyse des précipitations sur le moins de d'octobre 
+```{r}
+g_comm_octobre=g_comm[ g_comm$month==10, ]
+
+plot(g_comm_octobre$date, g_comm_octobre$precipitation)
+```
+
+```{r}
+moy = g_comm_octobre[,.(PrecMoy = max(precipitation)), by= g_comm_octobre$year]
+moy$data = as.integer(moy$data)
+plot(moy$g_comm_octobre,moy$PrecMoy)
+```
+Moyenne des préciptations par mois 
+
+```{r}
+g_comm$my=format(g_comm$date, format = "%Y-%m")
+g_comm = setDT(g_comm)
+
+moy = g_comm[,.(PrecMoy = mean(precipitation)), by= g_comm$my ]
+#moy$g_comm =as.Date(moy$g_comm, format = "%Y-%m")
+
+
+```
+
+```{r}
+
+ggplot(moy, aes(x=g_comm, y=PrecMoy)) +
+  geom_point(size=2, shape=23)
+
+```
+
+Maximum des préciptations par mois 
+
+```{r}
+g_comm$my=format(g_comm$date, format = "%Y-%m")
+g_comm = setDT(g_comm)
+
+moy = g_comm[,.(PrecMoy = mean(precipitation)), by= g_comm$my ]
+#moy$g_comm =as.Date(moy$g_comm, format = "%Y-%m")
+
+
+```
+
+```{r}
+
+ggplot(moy, aes(x=g_comm, y=PrecMoy)) +
+  geom_point(size=2, shape=23)
+
+```
+
+Etude de tous les points de toutes les localisations du département 
+
+
+```{r}
+comptage <- with(gard, table(latitude, longitude))
+liste_localisation <- as.data.frame(comptage)
+liste_localisation = liste_localisation[liste_localisation$Freq>0,  ]
+```
+
+```{r}
+df_depart = liste_localisation
+df_depart = df_depart[ , -3]
+df_depart$latitude=as.numeric(as.character(df_depart$latitude))
+df_depart$longitude=as.numeric(as.character(df_depart$longitude))
+
+
+seuil = c(100, 130, 150, 170, 200)
+df_depart$N100 =rep(0, dim(df_depart)[1])
+df_depart$N130 =rep(0, dim(df_depart)[1])
+df_depart$N150 =rep(0, dim(df_depart)[1])
+df_depart$N170 =rep(0, dim(df_depart)[1])
+df_depart$N200 =rep(0, dim(df_depart)[1])
+
+  
+for(i in 1:dim(df_depart)[1]){
+  print(i)
+  df_comm = gard[ which(gard$longitude==df_depart[i, 2] & gard$latitude==df_depart[i, 1]),  ]
+  df_comm =  df_comm[ , c(1,2,3,4)]
+  
+  for(j in 1:length(seuil)){
+    df_depart[i, j+2] = dim(df_comm[which(df_comm$precipitation > seuil[j]), ])[1]
+  }
+  
+}
+
+
+```
+
+Visualisation de la carte de France
+
+```{r}
+df_depart$longitude = as.numeric(df_depart$longitude)
+df_depart$latitude = as.numeric(df_depart$latitude)
+
+```
+
+
+```{r}
+SFmap <- leaflet(df_depart) %>%
+  addTiles() %>% 
+  setView(1.8854, 44.4331, zoom = 20) %>% 
+  addCircleMarkers(lng = ~longitude, lat = ~latitude, weight = 10, color = "blue", opacity = 0.25,              radius = sqrt(df_depart$N130), popup = ~as.character(N100)  ) %>% 
+  addLabelOnlyMarkers(lng = ~longitude, lat = ~latitude, label =  ~as.character(N130), 
+                      labelOptions = labelOptions(noHide = T, direction = 'center', textOnly = T))
+     
+SFmap
+```
+
