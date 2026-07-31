@@ -1,1182 +1,602 @@
----
-title: "Bureau d'étude - Code1"
-autor: 'Flora AUTER et Raissa YAMEOGO'
+
+title: "Modelling Extreme Precipitation Events in Southern France"
+author: "Raissa YAMEOGO and Flora AUTER"
 output:
-  html_document: default
-  html_notebook: default
-  pdf_document: default
-  word_document: default
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+  pdf_document:
+    toc: true
+  word_document:
+    toc: true
 ---
 
-Il y a une base de données contenant les précipitation en kg/m2/s et la vitesse du vent (pas utilisée pour le moment). Ce sont des données journalières et sur la prériode de 1951 à 2005. 
-Nous avons ces données pour différentes coordonnées (latitude, longitude) espacées de manière régulière.
-Dans un premier temps on s'interresse aux precipitations à un point géographique, la commune de Ponteil et Brésis dans le Gard. 
-latitude : 43.9974
-longitude : 3.38334
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
 
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "extRemes",
+  "ggplot2",
+  "leaflet",
+  "lubridate",
+  "POT",
+  "RColorBrewer"
+)
 
-# Parckages utiles 
-```{r}
-library(ggplot2)
-library(data.table)
-library(leaflet)
-library(POT)
-library(dplyr)
-library(lubridate)
-library(extRemes)
-library(glmnet)
-library(leaflet)
-library(ggplot2)
-library(data.table)
-library(leaflet)
-library(magrittr)
-library(dplyr)
-library(RColorBrewer)
-library(magrittr)
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Please install the following packages before running this notebook: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+set.seed(123)
 ```
 
-# Lecture des données 
+# 1. Project overview
 
-```{r}
-#Lecture de la tble du Gard 
-gard<-read.table("Aveyron.txt")
-colnames(gard) = c('date', 'latitude', 'longitude', 'precipitation', 'vent')
-gard$date = as.Date(as.character(gard$date), format = "%Y%m%d")
-gard$precipitation = gard$precipitation * 86400
+This project studies historical and projected precipitation data in Southern
+France, with a particular focus on extreme rainfall events.
+
+The analysis combines:
+
+- exploratory data analysis;
+- spatial visualisation;
+- geographic segmentation based on event frequency;
+- Gamma generalised linear models;
+- cross-validation;
+- peaks-over-threshold modelling;
+- stationary and non-stationary Generalised Pareto models.
+
+> **Data note.** The source data are not included in this repository.  
+> To reproduce the analysis, place the historical and projected datasets in
+> the `data/` directory and update the file paths in Section 3.
+
+# 2. Configuration
+
+```{r configuration}
+historical_file <- "data/historical_precipitation.txt"
+projection_file <- "data/projected_precipitation.txt"
+
+target_latitude <- 43.9999
+target_longitude <- 3.08447
+
+precipitation_thresholds <- c(100, 130, 150, 170, 200)
+extreme_value_threshold <- 120
 ```
 
+# 3. Data loading and preparation
 
+## 3.1 Helper functions
 
-données de projection 
-```{r}
-#Lecture de la tble du Gard 
-proj<-read.table("Aveyron-2006.txt")
-colnames(proj) = c('date', 'latitude', 'longitude', 'temperature', 'precipitation', 'vent')
-proj$date = as.Date(as.character(proj$date), format = "%Y%m%d")
-proj=proj[, -4]
-```
-
-Concaténation 
-```{r}
-gard = rbind(gard, proj)
-```
-
-
-```{r}
-gard$year = format(gard$date, format = "%Y")
-gard$month = format(gard$date, format = "%m")
-gard$day = format(gard$date, format = "%d")
-```
-
-# Debut de l'étude des précipitation pour la commune selectionnées
-```{r}
-SFmap <- leaflet() %>%
-  addTiles() %>% 
-  setView(3.08447, 43.9999, zoom = 20) %>% 
-  addCircleMarkers(lng = 3.08447, lat = 43.9999, weight = 10, color = "red", opacity = 0.74,              radius = 10)
-     
-SFmap
-```
-
-```{r}
-g_comm = gard[ which(gard$longitude==3.08447 & gard$latitude==43.9999),  ]
-g_comm =  g_comm[ , c(1,4,6,7,8)]
-
-```
-
-# Visualisation des données 
-```{r}
-ggplot(g_comm, aes(x=date, y=precipitation)) +
-  geom_point(size=2, shape=23)+
-  ggtitle("Précipitations au cours du temps") +
-  xlab("Date") + ylab("Précipitations (mm)")
-
-```
-Répartition des précipitations
-```{r}
-ggplot(g_comm, aes(x=precipitation)) + geom_histogram(binwidth=10, bins=1000) + ggtitle("Répartition des précipitations")+xlab("Précipitations (mm)")
-
-```
-Réparitions des précipitations supérieur à 20 mm par jour ( permet d'éviter l'écrasement des données)
-```{r}
-ggplot(g_comm[ - which(g_comm$precipitation<20 ), ], aes(x=precipitation)) + geom_histogram(binwidth=10)+ ggtitle("Répartition des précipitations")+xlab("Précipitations (mm)")
-
-
-```
-
-```{r}
-
-seuil = seq(80,500,10)
-nb_evenements=c()
-for(i in 1:length(seuil)){
-  nb_evenements = c(nb_evenements, dim(g_comm[which(g_comm$precipitation > seuil[i]), ])[1])
-  if(nb_evenements[length(nb_evenements)]==0){
-    break
+```{r helper-functions}
+read_historical_data <- function(path) {
+  if (!file.exists(path)) {
+    stop("Historical data file not found: ", path)
   }
-}
 
-rep = as.data.frame(cbind(seuil[1: length(nb_evenements)], nb_evenements))
-colnames(rep) = c('Seuil de précipitations (mm)', 'Nombre d\'evènements supérieurs au seuil')
-rep
-```
-Sur cette commune il semblerait qu'il y ait eu un seul evennement cevenol. 
+  data <- read.table(path, header = FALSE)
 
-Combien de jours durent ces evennements ? 
+  expected_columns <- c(
+    "date",
+    "latitude",
+    "longitude",
+    "precipitation",
+    "wind"
+  )
 
-```{r}
-g_comm[(which(g_comm$precipitation == max(g_comm$precipitation)) -3): (which(g_comm$precipitation == max(g_comm$precipitation))+3) ,]
-
-# Un seul jour
-```
-
-
-Moyenne des précipitation par an
-```{r}
-data = setDT(g_comm)
-```
-
-```{r}
-moy = data[,.(PrecMoy = mean(precipitation)), by= data$year]
-moy$data = as.integer(moy$data)
-plot(moy$data,moy$PrecMoy)
-```
-Maximum des précipitation par an
-```{r}
-max = data[,.(PrecMax = max(precipitation)), by= data$year]
-max$data = as.integer(max$data)
-plot(max$data,max$PrecMax)
-```
-```{r}
-ggplot(max, aes(x=data, y=PrecMax)) +
-  geom_point(size=2, shape=23)+
-  ggtitle("Maximum des précipitations par an au cours du temps") +
-  xlab("Date") + ylab("Précipitations (mm)")
-
-```
-
-
-
-
-Analyse des précipitations sur le moins de d'octobre 
-```{r}
-g_comm_octobre=g_comm[ g_comm$month==10, ]
-
-plot(g_comm_octobre$date, g_comm_octobre$precipitation)
-```
-
-```{r}
-moy = g_comm_octobre[,.(PrecMoy = max(precipitation)), by= g_comm_octobre$year]
-moy$data = as.integer(moy$data)
-plot(moy$g_comm_octobre,moy$PrecMoy)
-```
-Moyenne des préciptations par mois 
-
-```{r}
-g_comm$my=format(g_comm$date, format = "%Y-%m")
-g_comm = setDT(g_comm)
-
-moy = g_comm[,.(PrecMoy = mean(precipitation)), by= g_comm$my ]
-#moy$g_comm =as.Date(moy$g_comm, format = "%Y-%m")
-
-
-```
-
-```{r}
-
-ggplot(moy, aes(x=g_comm, y=PrecMoy)) +
-  geom_point(size=2, shape=23)
-
-```
-
-Maximum des préciptations par mois 
-
-```{r}
-g_comm$my=format(g_comm$date, format = "%Y-%m")
-g_comm = setDT(g_comm)
-
-moy = g_comm[,.(PrecMoy = mean(precipitation)), by= g_comm$my ]
-#moy$g_comm =as.Date(moy$g_comm, format = "%Y-%m")
-
-
-```
-
-```{r}
-
-ggplot(moy, aes(x=g_comm, y=PrecMoy)) +
-  geom_point(size=2, shape=23)
-
-```
-
-Etude de tous les points de toutes les localisations du département 
-
-
-```{r}
-comptage <- with(gard, table(latitude, longitude))
-liste_localisation <- as.data.frame(comptage)
-liste_localisation = liste_localisation[liste_localisation$Freq>0,  ]
-```
-
-```{r}
-df_depart = liste_localisation
-df_depart = df_depart[ , -3]
-df_depart$latitude=as.numeric(as.character(df_depart$latitude))
-df_depart$longitude=as.numeric(as.character(df_depart$longitude))
-
-
-seuil = c(100, 130, 150, 170, 200)
-df_depart$N100 =rep(0, dim(df_depart)[1])
-df_depart$N130 =rep(0, dim(df_depart)[1])
-df_depart$N150 =rep(0, dim(df_depart)[1])
-df_depart$N170 =rep(0, dim(df_depart)[1])
-df_depart$N200 =rep(0, dim(df_depart)[1])
-
-  
-for(i in 1:dim(df_depart)[1]){
-  print(i)
-  df_comm = gard[ which(gard$longitude==df_depart[i, 2] & gard$latitude==df_depart[i, 1]),  ]
-  df_comm =  df_comm[ , c(1,2,3,4)]
-  
-  for(j in 1:length(seuil)){
-    df_depart[i, j+2] = dim(df_comm[which(df_comm$precipitation > seuil[j]), ])[1]
+  if (ncol(data) != length(expected_columns)) {
+    stop(
+      "Unexpected number of columns in the historical dataset. ",
+      "Expected ", length(expected_columns), ", found ", ncol(data), "."
+    )
   }
-  
+
+  names(data) <- expected_columns
+  data$date <- as.Date(as.character(data$date), format = "%Y%m%d")
+
+  # Convert precipitation from kg/m²/s to mm/day.
+  data$precipitation <- data$precipitation * 86400
+
+  data
 }
 
-
-```
-
-Visualisation de la carte de France
-
-```{r}
-df_depart$longitude = as.numeric(df_depart$longitude)
-df_depart$latitude = as.numeric(df_depart$latitude)
-
-```
-
-
-```{r}
-SFmap <- leaflet(df_depart) %>%
-  addTiles() %>% 
-  setView(1.8854, 44.4331, zoom = 20) %>% 
-  addCircleMarkers(lng = ~longitude, lat = ~latitude, weight = 10, color = "blue", opacity = 0.25,              radius = sqrt(df_depart$N130), popup = ~as.character(N100)  ) %>% 
-  addLabelOnlyMarkers(lng = ~longitude, lat = ~latitude, label =  ~as.character(N130), 
-                      labelOptions = labelOptions(noHide = T, direction = 'center', textOnly = T))
-     
-SFmap
-```
-
-# Clustering en fonction de la fréquence annuelle des évenements cévenols
-
-Pour prendre en compte les corrélations des comportements climatiques des différents points géographiques, nous allons repartir les 1487 points géographiques de notre étude en 5 groupes suivant la fréquence des événements cévenols.
-On distinguera donc les zones où il y a eu le plus d'événements cévenols de celles où il y a quasiment rien eu.
-Pour cela, commençons par déterminer les fréquences de chaque point d'étude.
-
-```{r}
-# Nombre d'événement supérieurs un seuil par an 
-load("donnee_proj.Rdat")
-freq_evennement= function(depart, seuil){
-  donnee_m = depart
-  donnee_m$sup = (donnee_m$precipitation>seuil)*1
-  cont_sup100 = donnee_m %>% group_by(latitude, longitude, year) %>% summarise_at(vars(sup), funs(sum(., na.rm=TRUE)))
-  freq_sup100 =cont_sup100 %>% group_by(latitude, longitude) %>% summarise_at(vars(sup), funs(mean(., na.rm=TRUE)))
-  return(freq_sup100)
-}
-  
-
-freq_total = function(list_donnee, seuil){
-  liste_sup=list()
-  for( i in 1:length(list_donnee)){
-    liste_sup[[i]]=freq_evennement(donnee_proj[[i]],seuil)
+read_projection_data <- function(path) {
+  if (!file.exists(path)) {
+    stop("Projection data file not found: ", path)
   }
-  total_sup = liste_sup[[1]]
-  for(i in 2:length(liste_sup)){
-    total_sup = rbind(total_sup, liste_sup[[i]])
+
+  data <- read.table(path, header = FALSE)
+
+  expected_columns <- c(
+    "date",
+    "latitude",
+    "longitude",
+    "temperature",
+    "precipitation",
+    "wind"
+  )
+
+  if (ncol(data) != length(expected_columns)) {
+    stop(
+      "Unexpected number of columns in the projection dataset. ",
+      "Expected ", length(expected_columns), ", found ", ncol(data), "."
+    )
   }
-  total_sup$latitude = as.numeric(as.character(total_sup$latitude))
-  total_sup$longitude = as.numeric(as.character(total_sup$longitude))
-  
-  return(total_sup)
+
+  names(data) <- expected_columns
+  data$date <- as.Date(as.character(data$date), format = "%Y%m%d")
+
+  data
 }
 
-total = freq_total(donnee_proj,120)
-head(total) 
+add_calendar_variables <- function(data) {
+  data %>%
+    mutate(
+      year = year(date),
+      month = factor(month(date)),
+      day = day(date),
+      year_month = format(date, "%Y-%m")
+    )
+}
 ```
 
-Construisons les différents groupes.
-La classe 1 regroupe les zones ayant  enregistré en moyenne 2 évènements cévenols par an sur la période de 1951 à 2005.
-La classe 2 entre 1 et 2 événements par an
-la classe 3 au plus 1 événement cévenol.
+## 3.2 Load the datasets
 
-```{r}
-a=NULL
-#group1=total[which(total$sup>2),]
-group1=total[which(total$sup>1&total$sup<=2),]
-group2=total[which(total$sup<=1&total$sup>0.5),]
-group3=total[which(total$sup<=0.5&total$sup>0.10),]
-group4=total[which(total$sup<=0.10),]
+```{r load-data}
+historical_data <- read_historical_data(historical_file)
+projection_data <- read_projection_data(projection_file)
 
-group1$Groupe=rep(1,nrow(group1))
-group2$Groupe=rep(2,nrow(group2))
-group3$Groupe=rep(3,nrow(group3))
-group4$Groupe=rep(4,nrow(group4))
-#Liste=c(group1)##Carte pour chaque groupe.
-#Liste=c(group2)
-#Liste=c(group3)
-#Liste=c(group4)
-Liste=rbind(group1,group2,group3)
+# Keep only variables shared by both datasets before concatenation.
+projection_for_merge <- projection_data %>%
+  select(date, latitude, longitude, precipitation, wind)
 
+weather_data <- bind_rows(
+  historical_data,
+  projection_for_merge
+) %>%
+  add_calendar_variables()
+
+glimpse(weather_data)
 ```
 
-Représentation cartographique des différents groupes.
+# 4. Analysis of a selected geographic point
 
-```{r}
-vec_seuil = c(5.5,4.5,3.5, 2.5 , 1.5, 0)
-vec_label = c('5', '4','3', '2', '1')
-Liste$seg_seuil <- cut(Liste$Groupe, vec_seuil, include.lowest = T, labels = vec_label)
+```{r selected-location}
+location_data <- weather_data %>%
+  filter(
+    latitude == target_latitude,
+    longitude == target_longitude
+  )
 
-Liste$seg_seuil=as.numeric(as.character(Liste$seg_seuil))
-Liste$seg_seuil <- cut(Liste$seg_seuil, vec_seuil, include.lowest = T, labels = vec_label)
-beatCol <- colorFactor(palette = rev(brewer.pal(10, 'RdYlGn')), Liste$seg_seuil)
-
-SFmap <- leaflet(Liste) %>%
-  addTiles() %>% 
-  setView(5.87198, 43.9450, zoom = 7) %>% 
-  addCircleMarkers(lng = ~longitude, lat = ~latitude, weight = 10, color =  ~beatCol(Liste$seg_seuil), opacity = 0.5,radius = (Liste$sup), popup = ~as.character(sup)  ) %>% 
-  addLegend('bottomright', pal = beatCol, values = Liste$seg_seuil, title = 'Carte des clusters', opacity = 1)
-SFmap
+if (nrow(location_data) == 0) {
+  stop(
+    "No observation was found for the selected coordinates: ",
+    target_latitude, ", ", target_longitude
+  )
+}
 ```
 
-Pour la construction des modèles glm , récupérons les données de précipitation, de température et de vent correspondant à chaque groupe.
+## 4.1 Location map
 
-dpt=fonction qui renvoie le numéro du département dans la liste de départements étudiés.
+```{r location-map}
+leaflet() %>%
+  addTiles() %>%
+  setView(
+    lng = target_longitude,
+    lat = target_latitude,
+    zoom = 12
+  ) %>%
+  addCircleMarkers(
+    lng = target_longitude,
+    lat = target_latitude,
+    radius = 8,
+    weight = 2,
+    opacity = 0.8,
+    popup = paste(
+      "Latitude:", target_latitude,
+      "<br>Longitude:", target_longitude
+    )
+  )
+```
 
-```{r}
-dpt=function(loc){
-dep=0
-for(i in 1:length(donnee_proj)){
-  depart=donnee_proj[[i]]
-  if(dim(depart[depart$latitude == loc$latitude &  depart$longitude == loc$longitude, ])[1] >0){
-    dep=i
-    
+## 4.2 Precipitation over time
+
+```{r precipitation-time-series}
+ggplot(location_data, aes(x = date, y = precipitation)) +
+  geom_line(alpha = 0.6) +
+  labs(
+    title = "Daily precipitation over time",
+    x = "Date",
+    y = "Precipitation (mm/day)"
+  ) +
+  theme_minimal()
+```
+
+## 4.3 Distribution of precipitation
+
+```{r precipitation-distribution}
+ggplot(location_data, aes(x = precipitation)) +
+  geom_histogram(bins = 60) +
+  labs(
+    title = "Distribution of daily precipitation",
+    x = "Precipitation (mm/day)",
+    y = "Number of observations"
+  ) +
+  theme_minimal()
+```
+
+```{r precipitation-distribution-above-20}
+location_data %>%
+  filter(precipitation >= 20) %>%
+  ggplot(aes(x = precipitation)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of precipitation above 20 mm/day",
+    x = "Precipitation (mm/day)",
+    y = "Number of observations"
+  ) +
+  theme_minimal()
+```
+
+## 4.4 Number of threshold exceedances
+
+```{r exceedance-counts}
+threshold_sequence <- seq(80, 500, by = 10)
+
+exceedance_counts <- data.frame(
+  threshold = threshold_sequence,
+  number_of_exceedances = vapply(
+    threshold_sequence,
+    function(threshold) {
+      sum(location_data$precipitation > threshold, na.rm = TRUE)
+    },
+    numeric(1)
+  )
+) %>%
+  filter(number_of_exceedances > 0)
+
+exceedance_counts
+```
+
+## 4.5 Annual and monthly summaries
+
+```{r annual-summary}
+annual_summary <- location_data %>%
+  group_by(year) %>%
+  summarise(
+    mean_precipitation = mean(precipitation, na.rm = TRUE),
+    maximum_precipitation = max(precipitation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(annual_summary, aes(x = year, y = maximum_precipitation)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Annual maximum precipitation",
+    x = "Year",
+    y = "Maximum precipitation (mm/day)"
+  ) +
+  theme_minimal()
+```
+
+```{r monthly-summary}
+monthly_summary <- location_data %>%
+  group_by(year_month) %>%
+  summarise(
+    mean_precipitation = mean(precipitation, na.rm = TRUE),
+    maximum_precipitation = max(precipitation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+head(monthly_summary)
+```
+
+# 5. Spatial frequency of extreme precipitation
+
+## 5.1 Frequency calculation
+
+```{r spatial-frequency-function}
+compute_annual_exceedance_frequency <- function(data, threshold) {
+  data %>%
+    mutate(exceedance = as.integer(precipitation > threshold)) %>%
+    group_by(latitude, longitude, year) %>%
+    summarise(
+      annual_exceedances = sum(exceedance, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    group_by(latitude, longitude) %>%
+    summarise(
+      mean_annual_exceedances = mean(annual_exceedances, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+```
+
+```{r spatial-frequency}
+spatial_frequency <- compute_annual_exceedance_frequency(
+  weather_data,
+  threshold = extreme_value_threshold
+)
+
+head(spatial_frequency)
+```
+
+## 5.2 Geographic segmentation
+
+The points are grouped according to their average annual number of threshold
+exceedances.
+
+```{r geographic-segmentation}
+spatial_clusters <- spatial_frequency %>%
+  mutate(
+    cluster = case_when(
+      mean_annual_exceedances > 1 ~ "High frequency",
+      mean_annual_exceedances > 0.5 ~ "Moderate frequency",
+      mean_annual_exceedances > 0.1 ~ "Low frequency",
+      TRUE ~ "Very low frequency"
+    ),
+    cluster = factor(
+      cluster,
+      levels = c(
+        "High frequency",
+        "Moderate frequency",
+        "Low frequency",
+        "Very low frequency"
+      )
+    )
+  )
+
+table(spatial_clusters$cluster)
+```
+
+```{r cluster-map}
+cluster_palette <- colorFactor(
+  palette = "RdYlGn",
+  domain = spatial_clusters$cluster,
+  reverse = TRUE
+)
+
+leaflet(spatial_clusters) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng = ~longitude,
+    lat = ~latitude,
+    radius = ~pmax(3, 2 + mean_annual_exceedances),
+    color = ~cluster_palette(cluster),
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    popup = ~paste0(
+      "Cluster: ", cluster,
+      "<br>Mean annual exceedances: ",
+      round(mean_annual_exceedances, 2)
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = cluster_palette,
+    values = ~cluster,
+    title = "Extreme-event frequency"
+  )
+```
+
+# 6. Gamma GLM modelling
+
+The objective is to explain strictly positive precipitation using available
+meteorological and calendar covariates.
+
+## 6.1 Cross-validation function
+
+```{r glm-cross-validation}
+cross_validate_gamma_glm <- function(formula, data, k = 10, seed = 123) {
+  model_data <- data %>%
+    filter(precipitation > 0) %>%
+    tidyr::drop_na(all.vars(formula))
+
+  if (nrow(model_data) < k) {
+    stop("The number of observations must be greater than k.")
   }
-}
-  return(dep)
-}
 
+  set.seed(seed)
+  fold_id <- sample(rep(seq_len(k), length.out = nrow(model_data)))
 
-cluster=function(group){
-D1=NULL
-for(i in 1:nrow(group))
-{
-  point=data.frame(latitude=group[i,1],longitude=group[i,2])
-  d=dpt(point)
-  depart=donnee_proj[[d]]
-  df_loc = depart[depart$latitude==point$latitude & depart$longitude == point$longitude,]
-  D1=rbind(D1,df_loc)
-}
-return(D1)
-}
+  rmse <- numeric(k)
 
-G1=as.data.frame(cluster(group1))
-G1=G1[which(G1$precipitation>=15),]
-G2=cluster(group2)
-G2=G2[which(G2$precipitation>=15),]
-G3=cluster(group3)
-G3=G3[which(G3$precipitation>=15),]
-save(G1,file="G1.Rdat")
-save(G2,file="G2.Rdat")
-save(G3,file="G3.Rdat")
-G4=cluster(group4)
-G4=G4[which(G4$precipitation>=15)]
-a=group4[which(group4$sup==max(group4$sup)),c(1,2)]
-loc4=a
-loc4
-```
+  for (fold in seq_len(k)) {
+    training_data <- model_data[fold_id != fold, , drop = FALSE]
+    validation_data <- model_data[fold_id == fold, , drop = FALSE]
 
-Modèle GLM pour les groupe 1 2 et 3
-On choisit le point géographique où on a enregistré le maximum de précipitation dans chaque groupe.
+    fitted_model <- glm(
+      formula = formula,
+      data = training_data,
+      family = Gamma(link = "log")
+    )
 
-```{r}
-#Groupe 1
-loc1=as.data.frame(G1[which(G1$precipitation==max(G1$precipitation)),c(2,3)])
-donnee_1=G1[which((G1$latitude==loc1$latitude[1])&(G1$longitude==loc1$longitude[1])),]
-save(loc1,file="loc1.Rdat")
-#Groupe 2
-loc2=as.data.frame(G2[which(G2$precipitation==max(G2$precipitation)),c(2,3)])
-save(loc2,file="loc2.Rdat")
-donnee_2=G2[which((G2$latitude==loc2$latitude[1])&(G2$longitude==loc2$longitude[1])),]
+    predictions <- predict(
+      fitted_model,
+      newdata = validation_data,
+      type = "response"
+    )
 
-#Groupe 3
-loc3=as.data.frame(G3[which(G3$precipitation==max(G3$precipitation)),c(2,3)])
-save(loc3,file="loc3.Rdat")
-donnee_3=G3[which((G3$latitude==loc3$latitude[1])&(G3$longitude==loc3$longitude[1])),]
-#groupe4
-loc4=as.data.frame(G4[which(G4$precipitation==max(G4$precipitation)),c(2,3)])
-loc4=a
-save(loc4,file="loc3.Rdat")
-donnee_4=G4[which((G4$latitude==loc4$latitude[1])&(G4$longitude==loc4$longitude[1])),]
-donnee_4=donnee_proj[[4]]
-donnee_4=donnee_4[which(donnee_4$latitude==loc4$latitude & donnee_4$longitude==loc4$longitude),]
-save(donnee_4,file="donnee_4.Rdat")
-```
-
-#AJUSTEMENTS DES MODELES GLM
-
-Nous cherchons à expliquer les précipitations en fonction des covariables vent,température,année et mois.
-Afin de déterminer le meilleur modèle avec les variables les plus significatives selon les critères de sélections AIC, BIC et la RMSE, nous allons utiliser la validation croisée avec un nombre de blocs égale à 10,pour les 15 modèles possibles
-precipitation~vent+temperature+annee
-precipitation~vent+temperature
-precipitation~temperature+annee
-precipitation~vent+annee
-precipitation~temperature
-precipitation~vent
-precipitation~annee
-
-La fonction validation définie ci-dessous retournent les valeurs de l'AIC, le BIC et la RMSE correspondant à chaque modèle. Nous allons donc comparer ces valeurs afin de déterminer le modèle avec respectivement 0,1,2,3 covariables.Pour cela nous  considérerons le critère RMSE.
-
-```{r}
-validation=function(model,data,k=nrow(data)){
-  #model : formule
-  #data : donnÃ©es
-  #k : nombre de blocs pour la validation croisÃ©e
-  #valeur par dÃ©faut : k=n (leave-one cross validation)
-  data=data[sample(1:nrow(data)),]  #permutation alÃ©atoire des lignes
-  fit=glm(model,data=data,family=Gamma(link=))
- R2aj=summary(fit)$adj.r.squared
-  AIC=AIC(fit)
-  BIC=BIC(fit)
-  #Calcul de l'erreur en validation croisÃ©e
-  RMSE=NULL
-  lbloc= floor(nrow(data)/k)        #longueur des blocs
-  data=data[1:(k*lbloc),]
-  #extraction du nom de la variable Ã  expliquer dans la formule
-  #library('stringr')
-  #position=str_locate(model,'~')
-  #varaexp=str_sub(model,1,(position-1))[1]
- 
-  for (j in 1:k) {
-    indval=((j-1)*lbloc+1):(j*lbloc) #ensemble de validation
-    indapp=setdiff(1:dim(data)[1],indval)  #ensemble apprentissage
-    fit=glm(model,data=data[indapp,])  #ajustement du modÃ¨le sur ensemble d'apprentissage
-    pred=predict(fit,newdata=data[indval,])  #prÃ©diction de l'ensemble de validation
-    RMSE[j]=sqrt(mean((pred-data$precipitation[indval])^2))  #calcul de l'erreur de prÃ©diction
+    rmse[fold] <- sqrt(
+      mean(
+        (predictions - validation_data$precipitation)^2,
+        na.rm = TRUE
+      )
+    )
   }
-  return(data.frame('AIC'=AIC,'BIC'=BIC,'RMSE'=mean(RMSE)))
-}
-```
-AJUSTEMENT DES MODELES GLM POUR LE GROUPE 1.
 
-```{r}
-# Transformons la covariable mois en variable qualitative.
-donnee_1$month=as.factor(donnee_1$month)
-donnee_2$month=as.factor(donnee_2$month)
-donnee_3$month=as.factor(donnee_3$month)
-#Choix du meilleur modèle à une variable explicative.
-modèle=c("precip~vent","precip~température","precip~mois")
-resultat=validation(precipitation~vent,donnee_1,10)
-resultat=rbind(resultat,validation(precipitation~temperature,G1,10))
-#resultat=rbind(resultat,validation(precipitation~year,G1,10))
-resultat=rbind(resultat,validation(precipitation~month,G1,10))
-resultat=cbind(modèle,resultat)
-bestRMSE_1=resultat[which(resultat$RMSE==min(resultat$RMSE)),]
-fit=glm(precipitation~vent+temperature+month,data=donnee_1,family=Gamma(link = "log"))
+  full_model <- glm(
+    formula = formula,
+    data = model_data,
+    family = Gamma(link = "log")
+  )
 
-##choix du meilleur modèle à 2 paramètres.#VENt+annee
-
-modèle=c("precip~vent+temperature","precip~mois+temperature","precip~mois+vent")
-resultat2=validation(precipitation~vent+temperature,G1,10)
-#resultat2=rbind(resultat2,validation(precipitation~temperature+year,G1,10))
-#resultat2=rbind(resultat2,validation(precipitation~year+vent,donnee_1,10))
-resultat2=rbind(resultat2,validation(precipitation~month+temperature,G1,10))
-resultat2=rbind(resultat2,validation(precipitation~month+vent,G1,10))
-#resultat2=rbind(resultat2,validation(precipitation~month+year,G1,10))
-resultat2=cbind(modèle,resultat2)
-bestRMSE_2=resultat2[which(resultat2$RMSE==min(resultat2$RMSE)),]
-best=rbind(bestRMSE_1,bestRMSE_2)
-
-##choix du meilleur modèle à 3 paramètres.
-
-modèle=c("precip~temperature+vent+annee","precip~temperature+vent+mois","precip~temperature+annee+mois","precip~annee+mois+vent")
-#resultat3=validation(precipitation~vent+temperature+year,donnee_1,10)
-resultat3=rbind(resultat3,validation(precipitation~temperature+vent+month,donnee_1,10))
-resultat3=rbind(resultat3,validation(precipitation~month+temperature+year,donnee_1,10))
-resultat3=rbind(resultat3,validation(precipitation~month+vent+year,donnee_1,10))
-resultat3=cbind(modèle,resultat3)
-bestRMSE_3=resultat3[which(resultat3$RMSE==min(resultat3$RMSE)),]
-best=rbind(best,bestRMSE_3)
-names(best)=c("Best_fit","AIC","BIC","RMSE")
-mod=c("precip~",NA,NA,var(donnee_1$precipitation))
-best_Groupe1=rbind(mod,best)
-best_Groupe1
-```
-
-# AJUSTEMENT DES MODELES GLM POUR LE GROUPE 2.
-
-```{r}
-#Choix du meilleur modèle à un paramètre.
-modèle=c("precip~vent","precip~température","precip~mois")
-resultat=validation(precipitation~vent,G2,10)
-resultat=rbind(resultat,validation(precipitation~temperature,G2,10))
-#resultat=rbind(resultat,validation(precipitation~year,G2,10))
-resultat=rbind(resultat,validation(precipitation~month,G2,10))
-resultat=cbind(modèle,resultat)
-bestRMSE_1=resultat[which(resultat$RMSE==min(resultat$RMSE)),]
-
-##choix du meilleur modèle à 2 paramètres.
-
-modèle=c("precip~vent+temperature","precip~mois+temperature","precip~mois+vent")
-resultat2=validation(precipitation~vent+temperature,G2,10)
-#resultat2=rbind(resultat2,validation(precipitation~temperature+year,G2,10))
-#resultat2=rbind(resultat2,validation(precipitation~year+vent,G2,10))
-resultat2=rbind(resultat2,validation(precipitation~month+temperature,G2,10))
-resultat2=rbind(resultat2,validation(precipitation~month+vent,G2,10))
-#resultat2=rbind(resultat2,validation(precipitation~month+year,G2,10))
-resultat2=cbind(modèle,resultat2)
-bestRMSE_2=resultat2[which(resultat2$RMSE==min(resultat2$RMSE)),]
-best=rbind(bestRMSE_1,bestRMSE_2)
-
-##choix du meilleur modèle à 3 paramètres.
-
-modèle=c("precip~temperature+vent+annee","precip~temperature+vent+mois","precip~temperature+annee+mois","precip~annee+mois+vent")
-resultat3=validation(precipitation~vent+temperature+year,donnee_2,10)
-resultat3=rbind(resultat3,validation(precipitation~temperature+vent+month,donnee_2,10))
-resultat3=rbind(resultat3,validation(precipitation~month+temperature+year,donnee_2,10))
-resultat3=rbind(resultat3,validation(precipitation~month+vent+year,donnee_2,10))
-resultat3=cbind(modèle,resultat3)
-bestRMSE_3=resultat3[which(resultat3$RMSE==min(resultat3$RMSE)),]
-best=rbind(best,bestRMSE_3)
-names(best)=c("Best_fit","AIC","BIC","RMSE")
-mod=c("precip~",NA,NA,var(donnee_2$precipitation))
-best_Groupe2=rbind(mod,best)
-best_Groupe2
-```
-
-# AJUSTEMENT DES MODELES GLM POUR LE GROUPE 3.
-
-```{r}
-#Choix du meilleur modèle à un paramètre.
-modèle=c("precip~vent","precip~température","precip~mois")
-resultat=validation(precipitation~vent,G3,10)
-resultat=rbind(resultat,validation(precipitation~temperature,G3,10))
-#resultat=rbind(resultat,validation(precipitation~year,donnee_3,10))
-resultat=rbind(resultat,validation(precipitation~month,G3,10))
-resultat=cbind(modèle,resultat)
-bestRMSE_1=resultat[which(resultat$RMSE==min(resultat$RMSE)),]
-
-#choix du meilleur modèle à 2 paramètres.
-
-modèle=c("precip~vent+temperature","precip~mois+temperature","precip~mois+vent")
-resultat2=validation(precipitation~vent+temperature,G3,10)
-#resultat2=rbind(resultat2,validation(precipitation~temperature+year,donnee_3,10))
-#resultat2=rbind(resultat2,validation(precipitation~year+vent,donnee_1,10))
-resultat2=rbind(resultat2,validation(precipitation~month+temperature,G3,10))
-resultat2=rbind(resultat2,validation(precipitation~month+vent,G3,10))
-#resultat2=rbind(resultat2,validation(precipitation~month+year,donnee_3,10))
-resultat2=cbind(modèle,resultat2)
-bestRMSE_2=resultat2[which(resultat2$RMSE==min(resultat2$RMSE)),]
-best=rbind(bestRMSE_1,bestRMSE_2)
-
-#choix du meilleur modèle à 3 paramètres.
-
-modèle=c("precip~temperature+vent+annee","precip~temperature+vent+mois","precip~temperature+annee+mois","precip~annee+mois+vent")
-resultat3=validation(precipitation~vent+temperature+year,G3,10)
-resultat3=rbind(resultat3,validation(precipitation~temperature+vent+month,donnee_3,10))
-resultat3=rbind(resultat3,validation(precipitation~month+temperature+year,donnee_3,10))
-resultat3=rbind(resultat3,validation(precipitation~month+vent+year,donnee_3,10))
-resultat3=cbind(modèle,resultat3)
-bestRMSE_3=resultat3[which(resultat3$RMSE==min(resultat3$RMSE)),]
-best=rbind(best,bestRMSE_3)
-names(best)=c("Best_fit","AIC","BIC","RMSE")
-mod=c("precip~",NA,NA,var(donnee_3$precipitation))
-best_Groupe3=rbind(mod,best)
-best_Groupe3
-```
-groupe 4
-
-```{r}
-donnee_4=donnee_4[which(donnee_4$precipitation>=15),]
-#Choix du meilleur modèle à un paramètre.
-modèle=c("precip~vent","precip~température","precip~mois")
-resultat=validation(precipitation~vent,donnee_4,10)
-resultat=rbind(resultat,validation(precipitation~temperature,donnee_4,10))
-#resultat=rbind(resultat,validation(precipitation~year,donnee_3,10))
-resultat=rbind(resultat,validation(precipitation~month,donnee_4,10))
-resultat=cbind(modèle,resultat)
-bestRMSE_1=resultat[which(resultat$RMSE==min(resultat$RMSE)),]
-
-#choix du meilleur modèle à 2 paramètres.
-
-modèle=c("precip~vent+temperature","precip~mois+temperature","precip~mois+vent")
-resultat2=validation(precipitation~vent+temperature,donnee_4,10)
-#resultat2=rbind(resultat2,validation(precipitation~temperature+year,donnee_3,10))
-#resultat2=rbind(resultat2,validation(precipitation~year+vent,donnee_1,10))
-resultat2=rbind(resultat2,validation(precipitation~month+temperature,donnee_4,10))
-resultat2=rbind(resultat2,validation(precipitation~month+vent,donnee_4,10))
-#resultat2=rbind(resultat2,validation(precipitation~month+year,donnee_3,10))
-resultat2=cbind(modèle,resultat2)
-bestRMSE_2=resultat2[which(resultat2$RMSE==min(resultat2$RMSE)),]
-best=rbind(bestRMSE_1,bestRMSE_2)
-best
-
-```
-
-De façon générale on pourrait déduire de ces résultats que la covariable année est la plus significative parmi les 4.le meilleur modèle à unique variable explicative dans les 3 groupes est donc : précipitation~année. Ensuite vient la covariable vent, puis le mois.
-Nous constatons de ce fait que le temps, la saisonnalité ont un impact considérable sur les précipitations. Cela pourrait s'expliquer par la détérioration de la situation climatique qui s'aggrave d'année en année.
-
-
-
-## GLM avec les variable diff
-
-```{r}
-dpt=function(loc){
-  dep=0
-  for(i in 1:length(donnee_proj)){
-    depart=donnee_proj[[i]]
-    if(dim(depart[depart$latitude == loc$latitude &  depart$longitude == loc$longitude, ])[1] >0){
-      dep=i
-    }
-  }
-  return(dep)
+  data.frame(
+    formula = paste(deparse(formula), collapse = ""),
+    AIC = AIC(full_model),
+    BIC = BIC(full_model),
+    RMSE = mean(rmse)
+  )
 }
 ```
 
+## 6.2 Candidate models
 
-# diff temp
-```{r}
-liste_point_temp = c(43.4212 , 3.47146,43.4201 , 3.57007,
-43.4212 , 3.47146, 43.3493 , 3.47004,43.3482 , 3.56853,43.4189 , 3.66869,43.4896 , 3.76909,43.6334 , 3.7727,43.6334 , 3.7727,43.629 , 4.06961,43.5555 , 4.16627,43.4836 , 4.16397,43.4819 , 4.26267,43.5538 , 4.26509,43.7657 , 4.47078,43.7657 , 4.47078,43.9032 , 4.77447,44.1189 , 4.78375,44.3323 , 4.89328,44.4065 , 4.79625,44.5503 , 4.80254,44.7661 , 4.81204)
-M=matrix(liste_point_temp, ncol=2, byrow=T)
-loc_temp = as.data.frame(M)
-colnames(loc_temp)=c('latitude','longitude')
+```{r candidate-models}
+candidate_formulas <- list(
+  precipitation ~ wind,
+  precipitation ~ month,
+  precipitation ~ year,
+  precipitation ~ wind + month,
+  precipitation ~ wind + year,
+  precipitation ~ month + year,
+  precipitation ~ wind + month + year
+)
+
+glm_results <- bind_rows(
+  lapply(
+    candidate_formulas,
+    cross_validate_gamma_glm,
+    data = location_data,
+    k = 10
+  )
+) %>%
+  arrange(RMSE)
+
+glm_results
 ```
 
-```{r}
-load("donnee_proj.Rdat")
-load("loc1.Rdat")
-load("G1.Rdat")
+```{r best-glm}
+best_formula <- candidate_formulas[[
+  which.min(vapply(
+    candidate_formulas,
+    function(formula) {
+      cross_validate_gamma_glm(
+        formula = formula,
+        data = location_data,
+        k = 10
+      )$RMSE
+    },
+    numeric(1)
+  ))
+]]
 
-df=NULL
-for(i in 1:dim(loc_temp)[1]){
-  loc = loc_temp[i,]
-  lat=loc_temp[i,1]
-  lng=loc_temp[i,2]
-  d = dpt(loc)
-  depart=donnee_proj[[d]]
-  df_loc = depart[depart$latitude==lat & depart$longitude == lng,]
-  df_loc = df_loc[,c(1,4)]
-  df = rbind(df, df_loc)
-}
+best_gamma_glm <- glm(
+  formula = best_formula,
+  data = location_data %>% filter(precipitation > 0),
+  family = Gamma(link = "log")
+)
+
+summary(best_gamma_glm)
 ```
 
-```{r}
-diff_temp = df %>% group_by(date) %>% summarize(m = mean(temperature))
-colnames(diff_temp)=c('date', 'mean_temp')
+# 7. Extreme value analysis
+
+## 7.1 Threshold diagnostics
+
+```{r threshold-diagnostics}
+positive_precipitation <- location_data$precipitation[
+  location_data$precipitation > 0
+]
+
+mrlplot(
+  positive_precipitation,
+  nt = 50,
+  tlim = c(80, 130)
+)
+
+tcplot(
+  positive_precipitation,
+  tlim = c(80, 130),
+  nt = 50
+)
 ```
 
-# diff vent 
-```{r}
-liste_point_vent = c(44.4338 , 2.0862,44.3621 , 2.28706,44.362 , 2.48761,44.2902 , 2.38727,44.2182 , 2.28719, 44.0024 , 2.28738, 44.5779 , 2.38753,44.6498 , 2.48838)
-M=matrix(liste_point_vent, ncol=2, byrow=T)
-loc_vent = as.data.frame(M)
-colnames(loc_vent)=c('latitude','longitude')
+The final threshold should be selected using both graphical diagnostics and
+the number of observations remaining above the threshold.
+
+## 7.2 Stationary GPD model
+
+```{r stationary-gpd}
+stationary_gpd <- fitgpd(
+  positive_precipitation,
+  threshold = extreme_value_threshold
+)
+
+plot(stationary_gpd)
+stationary_gpd
 ```
 
-```{r}
-df=NULL
-for(i in 1:dim(loc_vent)[1]){
-  loc = loc_vent[i,]
-  lat=loc_vent[i,1]
-  lng=loc_vent[i,2]
-  d = dpt(loc)
-  depart=donnee_proj[[d]]
-  df_loc = depart[depart$latitude==lat & depart$longitude == lng,]
-  df_loc = df_loc[,c(1,6)]
-  df = rbind(df, df_loc)
-}
+## 7.3 Non-stationary GPD model
+
+The following model allows the scale parameter to vary with time.
+
+```{r non-stationary-gpd}
+extreme_value_data <- location_data %>%
+  mutate(year_numeric = as.numeric(year))
+
+non_stationary_gpd <- fevd(
+  x = precipitation,
+  data = extreme_value_data,
+  threshold = extreme_value_threshold,
+  scale.fun = ~ year_numeric,
+  type = "GP",
+  use.phi = TRUE,
+  verbose = TRUE
+)
+
+plot(non_stationary_gpd)
+non_stationary_gpd
 ```
 
-```{r}
-diff_vent = df %>% group_by(date) %>% summarize(m = mean(vent))
-colnames(diff_vent)=c('date', 'mean_vent')
+# 8. Model comparison and interpretation
+
+For model selection:
+
+- use RMSE to assess out-of-sample predictive performance;
+- use AIC and BIC to compare model fit while penalising complexity;
+- inspect diagnostic plots for Gamma GLMs and GPD models;
+- verify that parameter estimates remain stable across reasonable thresholds;
+- avoid drawing causal conclusions from statistical associations alone.
+
+# 9. Main limitations
+
+This analysis has several limitations:
+
+1. the quality of the conclusions depends on the climate model and the spatial
+   resolution of the data;
+2. nearby geographic points may exhibit spatial dependence;
+3. the fixed threshold used for the GPD analysis may not be optimal for every
+   location;
+4. non-stationarity may require richer time-varying structures;
+5. uncertainty from climate projections should be propagated into the final
+   risk estimates.
+
+# 10. Reproducibility
+
+To make the project fully reproducible:
+
+```r
+install.packages("renv")
+renv::init()
+renv::snapshot()
 ```
 
-# Création des nouvelles variables
-
-
-# Cluster 1 
-```{r}
-df1 = donnee_1[, c(1,4,5,6,7,8)]
-df1$year=as.numeric(as.character(df1$year))
-df11 = right_join(df1, diff_temp, by ='date')
-df12 = right_join(df11, diff_vent, by ='date')
-
-df12$diff_temp=df12$temperature - df12$mean_temp
-df12$diff_vent=df12$vent-df12$mean_vent
-
-data1= df12[,c(3,6,9,10)]
-```
-
-modèle glm avec les diff de temperature et de vent
-
-```{r}
-fit1=glm(precipitation~diff_vent+diff_temp+month,data1,family = "Gamma")
-plot(fit1)
-
-```
-
-
-```{r}
-library(leaps)
-```
-
-```{r}
-fit1 = glm(precipitation~., data=data1,family="Gamma")
-plot(fit1)
-summary(fit1)
-```
-
-# Cluster 2 
-```{r}
-df1 = donnee_2[, c(1,4,5,6,7,8)]
-df1$year=as.numeric(as.character(df1$year))
-df11 = right_join(df1, diff_temp, by ='date')
-df12 = right_join(df11, diff_vent, by ='date')
-
-df12$diff_temp=df12$temperature - df12$mean_temp
-df12$diff_vent=df12$vent-df12$mean_vent
-
-data2= df12[,c(3,6,9,10)]
-```
-
-Test des modeles avec les differences de vent et de temperarture
-```{r}
-fit2 = glm(precipitation~., data=data2,family="Gamma")
-plot(fit2)
-a=validation(precipitation~.,data=data1,10)
-a
-#summary(fit2)
-```
-
-# Cluster 3 
-```{r}
-df1 = donnee_3[, c(1,4,5,6,7,8)]
-df1$year=as.numeric(as.character(df1$year))
-df11 = right_join(df1, diff_temp, by ='date')
-df12 = right_join(df11, diff_vent, by ='date')
-
-df12$diff_temp=df12$temperature - df12$mean_temp
-df12$diff_vent=df12$vent-df12$mean_vent
-
-data3= df12[,c(3,6,9,10)]
-```
-
-Construction de la base glpbale
-```{r}
-f=function(data){
-  return(data[,c(1,4,6)])
-}
-
-depart =donnee_proj[[1]]
-
-s=depart %>% group_split(latitude,longitude)
-dt=lapply(s, f)
-
-cpt=1
-data=as.data.frame(dt[1])
-colnames(data)=c('date', paste('temperature_','1', sep=''), paste('vent_','1', sep=''))
-
-
-for(i in 2:length(dt)){
-  cpt=cpt+1
-  data2=as.data.frame(dt[i])
-  colnames(data2)=c('date', paste('temperature_',as.character(cpt), sep=''), paste('vent_',as.character(cpt), sep=''))
-  data=merge(data,data2, by='date', all.x=TRUE, all.y=TRUE )
-}
-
-for(j in 2:length(donnee_proj)){
-  print(j)
-  depart =donnee_proj[[j]]
-  s=depart %>% group_split(latitude, longitude)
-  dt=lapply(s, f)
-
-  for(i in 2:length(dt)){
-    cpt=cpt+1
-    data2=as.data.frame(dt[i])
-    colnames(data2)=c('date', paste('temperature_',as.character(cpt), sep=''), paste('vent_',as.character(cpt), sep=''))
-    data=merge(data,data2, by='date', all.x=TRUE, all.y=TRUE )
-  }
-}
-
-save(data, file='data.Rdat')
-load("data.Rdat")
-View(data)
-dataR=cbind(year=year(data$date),month=month(data$date),data)
-dataR=dataR[,-3]
-save(data, file='data.Rdat')
-
-View(dataR)
-##Modèle glm pour le premier groupe 1.
-##on ajuste le modèle sur le point ou on a observé le maximum de precipitations.
-base=function(loc)
-{
-dpt(loc)
-depart1=donnee_proj[[dpt(loc)]]
-donnee_loc1=depart1[which(depart1$latitude==loc$latitude & depart1$longitude==loc$longitude),]
-T1=cbind(precipitation=donnee_loc1$precipitation,data)
-T1=T1[-which(T1$precipitation==0),]
-T1=cbind(year=year(T1$date),month=month(T1$date),T1)
-T1=T1[,-4]
-return(T1)
-}
-T1=base(loc1)
-
-View(T1)
-M1=glm(precipitation~.,data=T1,family=Gamma(link="log"))
-M1
-save(M1,file='M1.Rdat')
-load("M1.Rdat")
-
-plot(M1)
-##Pour ce modele recupérons les covariables importantes
-C=coefficients(M1)
-C=C[-which(is.na(C)==TRUE)]
-pv=summary(M1)$coefficients[,4]
-Coe=data.frame(C,pv)
-Coe_imp=Coe[which(Coe$pv<0.05),]
-library(stringr)
-position=str_locate(row.names(Coe_imp),'_')
-pos=str_sub(row.names(Coe_imp),position[1]+1,position[1]+4)
-pos=as.data.frame(pos)
-for(i in 1:nrow(pos))
-{pos[i,1]=as.numeric(as.character(pos[i,1]))
-   
-}
-pos=pos[-which(is.na(pos)),]
-pos=as.numeric(as.integer(pos))
-load("local.Rdat")
-
-##recupération des latitudes et longitudes
-loct=local[[1]]
-dat=NULL
-for(i in 2:15)
-{
-   loct=rbind(loct,data.frame(local[[i]]))
-}
-dat1=loct[pos,]
-
-
-##
-library(leaps)
-load("T1.Rdat")
-fit_lm=lm(precipitation~.,data=T1)
-H1=cbind(log=log(T1$precipitation),T1)
-H1=H1[,-4]
-fit_log=lm(log~.,data=H1)
-
-stepAIC(fit_lm)
-a=regsubsets(log~., data=H1, weights=NULL, nbest=2, nvmax=1000,
- force.in=NULL, force.out=NULL, intercept=TRUE,
- method="backward")
-View(a$force.in[which(a$force.out==TRUE)])
-a
-library(MASS)
-leaflet(data=dat)
-```
-
-
-
-
-
-
-```{r}
-SFmap <- leaflet(dat1) %>%
-  addTiles() %>% 
-  setView(5.87198, 43.9450, zoom = 7) %>% 
-  addCircleMarkers(lng = ~as.numeric(dat1$longitude), lat = ~as.numeric(dat1$latitude), weight = 10, opacity = 0.5,radius = (0.5),col="blue") 
-SFmap
-dat1$latitude=as.numeric(as.character(dat1$latitude))
-dat1$longitude=as.numeric(as.character(dat1$longitude))
-
-map_leaflet <- leaflet() %>%
-  addProviderTiles('Stamen.TonerHybrid') %>%
-  addMarkers(data = dat1)
-map_leaflet
-
-
-
-
-```
-
-
-
-
-ajustement du modele pour le groupe 2
-
-
-```{r}
-
-library(MASS)
-m=glm(precipitation~1,data=T1,family="Gamma")
-
-summary(m)
-step(fit_lm,steps=10,trace=FALSE,direction='forward')
-
-
-
-T2=base(loc2)
-
-View(T2)
-M2=glm(precipitation~.,data=T2,family=Gamma(link="log"))
-save(M2,file='M2.Rdat')
-plot(M2)
-```
-
-groupe3
-
-```{r}
-T3=base(loc3)
-
-View(T3)
-M3=glm(precipitation~.,data=T3,family=Gamma(link="log"))
-M3
-save(M3,file='M3.Rdat')
-
-plot(M3)
-```
-
-Sans les extremes 
-
-```{r}
-V1=T1[-which(T1$precipitation>120),]
-V2=T2[-which(T2$precipitation>120),]
-V3=T3[-which(T3$precipitation>120),]
-
-Mod1=glm(precipitation~.,data=V1,family=Gamma(link="log"))
-Mod2=glm(precipitation~.,data=V2,family=Gamma(link="log"))
-Mod3=glm(precipitation~.,data=V3,family=Gamma(link="log"))
-plot(Mod1)
-plot(Mod2)
-plot(Mod3)
-save(Mod1,file="Mod1.Rdat")
-save(Mod2,file="Mod2.Rdat")
-save(Mod3,file="Mod3.Rdat")
-
-
-```
-
-Valeurs extremes dans les clusters
-
-
-```{r}
-```
-
-
-```{r}
-load("loc1.Rdat")
-
-load("donnee_proj.Rdat")
-
-load("donnee_proj_F.Rdat")
-
-R=donnee_proj[[dpt(loc1[1,])]]
-
-Rf=donnee_proj_F[[dpt(loc1[1,])]]
-
-R1_hist=R[which(R$latitude==loc1[1,]$latitude & R$longitude==loc1[1,]$longitude),]
-
-R1_fut=Rf[which(Rf$latitude==loc1[1,]$latitude & Rf$longitude==loc1[1,]$longitude),]
-
-R1=rbind(R1_hist,R1_fut)
-
-##Recherche du seuil
-
-tlim=c(80,130) 
-mrlplot(R1$precipitation,nt=50,tlim=tlim);
-tcplot(R1$precipitation,tlim,nt=50)
-
-u=120
-R1$year=as.numeric(as.character(R1$year))
-##modele stiotionnaire
-fit_gpd=fitgpd(R1$precipitation,threshold=u)
-plot(fit_gpd)
-##modele non stationnaire
-modele1=fevd(R1$precipitation,data=R1,threshold =120,scale.fun = ~year,type="GP",use.phi=TRUE,verbose = TRUE)
-plot(modele1)
-modele1
-
-scale=function(t)
-{
-   return(1.18+0.001529023*t)
-}
-t=1951:2100
-scale=scale(t)
-plot(t,scale,type="l")
-i=-0.219
-E=u+scale/(1-i)
-plot(t,E,type='l')
-
-loc4
-```
-
-
-cluster2
-
-```{r}
-load("loc2.Rdat")
-
-R_2=donnee_proj[[dpt(loc2[1,])]]
-
-R_2f=donnee_proj_F[[dpt(loc2[1,])]]
-
-R2_hist=R_2[which(R_2$latitude==loc2[1,]$latitude & R_2$longitude==loc2[1,]$longitude),]
-
-R2_fut=R_2f[which(R_2f$latitude==loc2[1,]$latitude & R_2f$longitude==loc2[1,]$longitude),]
-
-R2=rbind(R2_hist,R2_fut)
-
-tlim=c(100,250) 
-mrlplot(R2$precipitation,nt=50,tlim=tlim);
-tcplot(R2$precipitation,tlim,std.err=FALSE)
-
-u=120
-R2$year=as.numeric(as.character(R2$year))
-##modele stiotionnaire
-fit_gpd_2=fitgpd(R2$precipitation,threshold=u)
-plot(fit_gpd_2)
-##modele non stationnaire
-modele2=fevd(R2$precipitation,data=R2,threshold =120,scale.fun = ~year,type="GP",use.phi=TRUE,verbose = TRUE)
-plot(modele2)
-modele2
-scale=function(t)
-{
-   return(3.89+0.01296817*t)
-}
-t=1951:2100
-scale=scale(t)
-plot(t,scale,type="l")
-i=-0.177
-E=u+scale/(1-i)
-plot(t,E,type='l')
-
-```
-
-Cluster3
-
-```{r}
-
-load("loc3.Rdat")
-
-R_3=donnee_proj[[dpt(loc3[1,])]]
-
-R_3f=donnee_proj_F[[dpt(loc3[1,])]]
-
-R3_hist=R_3[which(R_3$latitude==loc3[1,]$latitude & R_3$longitude==loc3[1,]$longitude),]
-
-R3_fut=R_3f[which(R_3f$latitude==loc3[1,]$latitude & R_3f$longitude==loc3[1,]$longitude),]
-
-R3=rbind(R3_hist,R3_fut)
-
-tlim=c(100,250) 
-mrlplot(R3$precipitation,nt=50,tlim=tlim);
-
-tcplot(R3$precipitation,tlim,std.err=FALSE)
-
-u=120
-R3$year=as.numeric(as.character(R3$year))
-##modele stiotionnaire
-fit_gpd_3=fitgpd(R3$precipitation,threshold=u)
-plot(fit_gpd_3)
-##modele non stationnaire
-modele3=fevd(R3$precipitation,data=R3,threshold =120,scale.fun = ~year,type="GP",use.phi=TRUE,verbose = TRUE)
-plot(modele3)
-modele3
-scale=function(t)
-{
-   return(3.85+0.02*t)
-}
-t=1951:2100
-scale=scale(t)
-plot(t,scale,type="l")
-i=-0.277
-E=u+scale/(1-i)
-plot(t,E,type='l')
-
-
-
-
-```
-
-
-```{r}
-depart07=donnee_proj[[4]]
-colnames(depart07) = c('date', 'latitude', 'longitude', 'temperature','precipitation', 'vent')
-pointG=depart07[which((depart07$longitude==4.0917)&(depart07$latitude==44.3481)),]
-annee=year(pointG$date)
-pointG=data.frame(pointG,annee)
-```
-
-Pour ce point géographique, nous avons compté le nombre d'observations dont la précipitation est supérieure à 50,60, 80, 100 et 120 mm. On observe qu'il a très peu de données dépassant le seuil de 120 mm.
-
-```{r}
-comptesup50=pointG[,5]>50
-sum(comptesup50)
-comptesup60=pointG[,5]>60
-sum(comptesup60)
-comptesup80=pointG[,5]>80
-sum(comptesup80)
-comptesup100=pointG[,5]>100
-sum(comptesup100)
-comptesup120=pointG[,5]>120
-sum(comptesup120)
-```
-Ajustons la méthode de dépassement de seuil à cette distribution de précipitations. Pour cela, nous allons définir un seuil convenable pour construire le modele.
-
-En nous basant sur la variation des paramètres de la loi GPD en fonction du seuil et en tenant compte des intervalles de confiances donnés par les commandes mrlplot et tcplot, on observe qu'autour de 60mm les paramètres de la loi restent constants et les intervalles de confiance sont assez reduits.
-De plus le nombre d'observations superieures à ce seuil(109 observations) est assez convenable pour réaliser le modèle.
-
-```{r}
-tlim=c(40,130) 
-mrlplot(pointG$precipitation,nt=50,tlim=tlim);
-tcplot(pointG$precipitation,tlim,nt=50)
-u=60
-fit_gpd=fitgpd(pointG$precipitation,threshold=u)
-plot(fit_gpd)
-```
-
-Les graphiques qqplot et probabilty plot sont une technique permettant d'évaluer si nos données de précipitations supérieures au seuil consideré  suivent ou non la loi de pareto genéralisée.
-On observe donc après analyse de ces graphiques que ce modèle est assez bon.
-
-Dans la suite de notre étude, nous allons imposer une tendance au paramètre d'échelle de notre modèle, pour cela nous allons centrer et reduire nos covariables : precipitation, température et vitesse du vent.
-```{r}
-precipitationC=(pointG$precipitation-mean(pointG$precipitation))/sd(pointG$precipitation)
-temperatureC=(pointG$temperature-mean(pointG$temperature))/sd(pointG$temperature)
-ventC=(pointG$vent-mean(pointG$vent))/sd(pointG$vent)
-pointGcentre=data.frame(pointG[,c(1,2,3,8)],precipitationC,ventC,temperatureC)
-```
-
-Ajustement de la loi GPD non stationnaire sur nos données centrées réduites avec paramètre d'échelle dépendant de la temperature et de la vitesse du vent.
-
-```{r}
-tlim=c(-3,3) 
-mrlplot(pointGcentre$precipitation,nt=50,tlim=tlim);
-tcplot(pointGcentre$precipitation,tlim,nt=50)
-modele1=fevd(pointGcentre$precipitation,data=pointGcentre,threshold =1.25,scale.fun = ~temperatureC+ventC,type="GP",use.phi=TRUE,verbose = TRUE)
-plot(modele1)
-modele1
-```
-
-En observant les graphiques ci-dessus, on constate que nos données coincident en grande partie avec les quantiles theoriques.De plus le paramètre de forme est positif ce qui traduit le fait qu'on ait des valeurs extremes dans nos données. On peut alors conclure que ce modele est assez bon pour l'ajustement de nos données.
-
-Pour la suite,imposons une tendance temporaire au paramètre d'échelle.
-
-```{r}
-tlim=c(-3,3) 
-mrlplot(pointG$precipitation,nt=50,tlim=tlim);
-tcplot(pointG$precipitation,tlim,)
-  modele2=fevd(pointGcentre$precipitationC,data=pointGcentre,threshold =1.25,scale.fun = ~annee,type="GP",use.phi=TRUE,verbose = TRUE)
-plot(modele2)
-  modele2
-```
-
-De même, les données semblent  bien ajustés par ce modèle à travers l'analyse des graphiques. Le modèle ajusté est à queue lourde. Cependant, en comparant les AIC et les BIC des modèles non stationnaires 1 et 2, on peut dire que le meilleur des deux est le modèle 1 qui a les plus faibles AIC et BIC.
-
+The resulting `renv.lock` file should be committed to the repository.
